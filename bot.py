@@ -13,8 +13,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SUPERODDS_URL = "https://betesporte.bet.br/api/PreMatch/GetEvents?sportId=999&tournamentId=4200000001"
-INTERVAL_SECONDS = 30
-SEND_EACH_EVENT_SEPARATELY = False  # True = 1 msg por pick; False = agrupa
+SEND_EACH_EVENT_SEPARATELY = False  # True = 1 msg por pick nova; False = agrupa as novas
 
 BROWSER_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -49,6 +48,13 @@ def to_float(s: str) -> Optional[float]:
     except ValueError:
         return None
 
+def fmt_odd(x: float) -> str:
+    # formata para 2 casas (ajuste se quiser)
+    try:
+        return f"{float(x):.2f}".rstrip('0').rstrip('.')
+    except Exception:
+        return str(x)
+
 # ================== MODELO ==================
 class UnderPick:
     def __init__(self, event_id: str, home: str, away: str, line_raw: str, odd: float):
@@ -67,12 +73,28 @@ class UnderPick:
     def title(self) -> str:
         return f"{self.home} (x) {self.away} para ter menos de {self.line_raw} gols na partida"
 
-    def to_message_block(self) -> str:
-        return (
-            "🏠 Casa: Betesporte\n"
-            f"🎯 Mercado: {self.title()}\n\n"
-            f"📌 Cotação: \"{self.odd}\"\n"
-        )
+# ================== MENSAGENS (HTML) ==================
+def build_new_message(p: UnderPick) -> str:
+    return (
+        "<b>🏠 Casa:</b> Betesporte\n"
+        f"<b>🎯 Mercado:</b> {p.title()}\n\n"
+        f"📌 <b>Odd:</b> {fmt_odd(p.odd)}"
+    )
+
+def build_change_message(p: UnderPick, old_odd: float) -> str:
+    arrow = "📈" if p.odd > old_odd else "📉" if p.odd < old_odd else "↔️"
+    return (
+        f"<b>🔁 MUDANÇA DE ODD {arrow}</b>\n"
+        "<b>🏠 Casa:</b> Betesporte\n"
+        f"<b>🎯 Mercado:</b> {p.title()}\n\n"
+        f"📌 <b>Odd:</b> <s>{fmt_odd(old_odd)}</s> → <b>{fmt_odd(p.odd)}</b>"
+    )
+
+def build_group_new_messages(picks: List[UnderPick]) -> str:
+    # Agrupa várias novas em uma única mensagem
+    blocks = [build_new_message(p) for p in picks]
+    msg = "\n\n".join(blocks)
+    return (msg[:4090] + "…") if len(msg) > 4096 else msg
 
 # ================== CORE ==================
 async def fetch_json(max_retries: int = 3, backoff: float = 1.5) -> dict:
@@ -142,7 +164,7 @@ def extract_picks(payload: dict) -> List[UnderPick]:
                 if line_f is None:
                     continue
 
-                # 2) Agora confirmar que existe o mercado "Total de Gols" com opção "Menos de X"
+                # 2) Confirmar mercado "Total de Gols" com opção "Menos de X"
                 markets = event.get("markets", []) or []
                 found_odd: Optional[float] = None
                 for market in markets:
@@ -167,19 +189,10 @@ def extract_picks(payload: dict) -> List[UnderPick]:
                         break
 
                 if found_odd is None:
-                    # Se por algum motivo o mercado não estiver presente,
-                    # pula (não é o que queremos enviar)
                     continue
 
                 out.append(UnderPick(str(event_id), home, away, line_raw, found_odd))
     return out
-
-def build_message(picks: List[UnderPick]) -> str:
-    if not picks:
-        return ""
-    blocks = [p.to_message_block() for p in picks]
-    msg = "\n".join(blocks)
-    return (msg[:4090] + "…") if len(msg) > 4096 else msg
 
 # ================== LOOP ==================
 async def run_bot():
@@ -187,40 +200,68 @@ async def run_bot():
         raise RuntimeError("Configure TELEGRAM_TOKEN e TELEGRAM_CHAT_ID no .env")
 
     bot = Bot(token=TOKEN)
-    last_sent: Dict[str, float] = {}  # key -> last odd
+    last_sent: Dict[str, float] = {}  # key -> última odd enviada
 
     while True:
         try:
             data = await fetch_json()
             picks = extract_picks(data)
 
-            changed: List[UnderPick] = []
+            new_picks: List[UnderPick] = []
+            changed_picks: List[Tuple[UnderPick, float]] = []
+
             for p in picks:
                 prev = last_sent.get(p.key)
-                if prev is None or p.odd != prev:
-                    changed.append(p)
+                if prev is None:
+                    new_picks.append(p)
+                elif p.odd != prev:
+                    changed_picks.append((p, prev))
 
-            if changed:
-                # Atualiza estado
-                for p in changed:
-                    last_sent[p.key] = p.odd
+            # Atualiza o estado (pode atualizar após enviar se quiser garantir reenvio em caso de falha)
+            for p in new_picks:
+                last_sent[p.key] = p.odd
+            for p, _old in changed_picks:
+                last_sent[p.key] = p.odd
 
+            # Enviar NOVAS
+            if new_picks:
                 if SEND_EACH_EVENT_SEPARATELY:
-                    for p in changed:
-                        await bot.send_message(chat_id=CHAT_ID, text=p.to_message_block())
-                        await asyncio.sleep(0.5)
+                    for p in new_picks:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=build_new_message(p),
+                            parse_mode="HTML",
+                        )
+                        await asyncio.sleep(0.4)
                 else:
-                    text = build_message(changed)
+                    text = build_group_new_messages(new_picks)
                     if text:
-                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=text,
+                            parse_mode="HTML",
+                        )
+
+            # Enviar MUDANÇAS (1 por mensagem para destacar)
+            for p, old in changed_picks:
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=build_change_message(p, old),
+                    parse_mode="HTML",
+                )
+                await asyncio.sleep(0.4)
 
         except Exception as e:
-            # Notifica falha desta rodada (opcionalmente com throttling)
+            # Notifica falha desta rodada (opcional: pode silenciar/limitar)
             try:
-                await bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Erro na varredura: {type(e).__name__}: {e}")
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"⚠️ Erro na varredura: {type(e).__name__}: {e}",
+                )
             except Exception:
                 pass
 
+        # Delay aleatório para reduzir padrão detectável (mais seguro que intervalo fixo)
         await asyncio.sleep(random.uniform(28, 32))
 
 if __name__ == "__main__":
